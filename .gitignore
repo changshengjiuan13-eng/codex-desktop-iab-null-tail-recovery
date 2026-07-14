@@ -1,0 +1,9 @@
+*.exe
+*.asar
+*.zip
+*.7z
+*.dmp
+*.log
+auth.json
+cookies*
+rollout-*.jsonl

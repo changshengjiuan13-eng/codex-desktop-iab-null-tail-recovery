@@ -1,0 +1,186 @@
+name: build-core006
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CORE006_PATCH_SHA256: 2FFE21BD547A9D757B44196F6C88C3779CFDDD6AFA257CB2EBE4B17FDC7CC767
+
+jobs:
+  regression-tests:
+    name: Core006 focused regression tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Checkout patch bundle
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: patch-bundle
+          persist-credentials: false
+
+      - name: Checkout exact upstream Codex source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: openai/codex
+          ref: 049586f41571e74b44c841868bca3a2233214a71
+          path: source
+          persist-credentials: false
+
+      - name: Verify source and apply Core006 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "049586f41571e74b44c841868bca3a2233214a71"
+          test "$(sha256sum patch-bundle/core006.patch | awk '{print toupper($1)}')" = "$CORE006_PATCH_SHA256"
+          git -C source apply --check ../patch-bundle/core006.patch
+          git -C source apply ../patch-bundle/core006.patch
+          git -C source diff --check
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: 1.95.0
+
+      - name: Install Linux test dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            pkg-config libcap-dev bubblewrap
+
+      - name: Verify Rust formatting
+        working-directory: source/codex-rs
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Test legacy upstream stream-error decoding
+        working-directory: source/codex-rs
+        shell: bash
+        env:
+          RUST_MIN_STACK: "16777216"
+        run: cargo test -p codex-api cyber_policy_error_event_is_fatal_for_proxy_shapes -- --nocapture
+
+      - name: Run all Core005/Core006 turn completion tests
+        working-directory: source/codex-rs
+        shell: bash
+        env:
+          RUST_MIN_STACK: "16777216"
+        run: cargo test -p codex-core --test all 'suite::turn_completion::' -- --nocapture
+
+  build-windows-x64:
+    name: Build Core006 codex.exe
+    runs-on: windows-2022
+    timeout-minutes: 240
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_DEBUG: "none"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
+      RUST_MIN_STACK: "16777216"
+    steps:
+      - name: Checkout patch bundle
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: patch-bundle
+          persist-credentials: false
+
+      - name: Checkout exact upstream Codex source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: openai/codex
+          ref: 049586f41571e74b44c841868bca3a2233214a71
+          path: source
+          persist-credentials: false
+
+      - name: Verify source and apply Core006 patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $commit = (git -C source rev-parse HEAD).Trim()
+          if ($commit -ne '049586f41571e74b44c841868bca3a2233214a71') {
+            throw "Unexpected upstream commit: $commit"
+          }
+          $patchHash = (Get-FileHash -Algorithm SHA256 -LiteralPath patch-bundle/core006.patch).Hash
+          if ($patchHash -ne $env:CORE006_PATCH_SHA256) {
+            throw "Unexpected Core006 patch hash: $patchHash"
+          }
+          git -C source apply --check ../patch-bundle/core006.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C source apply ../patch-bundle/core006.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C source diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-pc-windows-msvc
+
+      - name: Configure MSVC environment and LLVM linker
+        uses: ./source/.github/actions/setup-msvc-env
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Configure Cargo target directory
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'cargo-target'
+          "CARGO_TARGET_DIR=$target" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build release codex.exe
+        working-directory: source/codex-rs
+        shell: pwsh
+        run: |
+          cargo build --target x86_64-pc-windows-msvc --release -p codex-cli --bin codex
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify and stage artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-msvc\release\codex.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw "Missing built executable: $exe" }
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'staging'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          $artifact = Join-Path $stage 'core006-codex.exe'
+          Copy-Item -LiteralPath $exe -Destination $artifact
+          $version = (& $artifact --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Built codex.exe failed its version smoke test.' }
+          $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $artifact
+          [ordered]@{
+            algorithm = 'SHA256'
+            hash = $hash.Hash
+            file = 'core006-codex.exe'
+            bytes = (Get-Item -LiteralPath $artifact).Length
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'core006-sha256.json') -Encoding utf8
+          [ordered]@{
+            status = 'BUILT'
+            sourceCommit = '049586f41571e74b44c841868bca3a2233214a71'
+            sourceTag = 'rust-v0.144.0-alpha.4'
+            patchSha256 = $env:CORE006_PATCH_SHA256
+            releaseProfile = [ordered]@{
+              codegenUnits = $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS
+              debug = $env:CARGO_PROFILE_RELEASE_DEBUG
+              lto = $env:CARGO_PROFILE_RELEASE_LTO
+            }
+            version = $version
+            builtAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'core006-build-metadata.json') -Encoding utf8
+          Write-Host "Built $version"
+          Write-Host "SHA256 $($hash.Hash)"
+
+      - name: Upload Core006 Windows artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: core006-windows-x64
+          path: |
+            staging/core006-codex.exe
+            staging/core006-sha256.json
+            staging/core006-build-metadata.json
+          if-no-files-found: error
+          retention-days: 1

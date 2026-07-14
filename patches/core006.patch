@@ -1,0 +1,551 @@
+diff --git a/codex-rs/codex-api/src/sse/responses.rs b/codex-rs/codex-api/src/sse/responses.rs
+index 70f96cb..e51fc61 100644
+--- a/codex-rs/codex-api/src/sse/responses.rs
++++ b/codex-rs/codex-api/src/sse/responses.rs
+@@ -158,10 +158,13 @@ struct ResponseCompletedOutputTokensDetails {
+ 
+ #[derive(Deserialize, Debug)]
+ pub struct ResponsesStreamEvent {
+-    #[serde(rename = "type")]
++    #[serde(rename = "type", default)]
+     pub(crate) kind: String,
+     pub(crate) headers: Option<Value>,
+     metadata: Option<Value>,
++    error: Option<Value>,
++    code: Option<String>,
++    message: Option<String>,
+     response: Option<Value>,
+     item: Option<Value>,
+     item_id: Option<String>,
+@@ -326,6 +329,14 @@ impl ResponsesEventError {
+ pub fn process_responses_event(
+     event: ResponsesStreamEvent,
+ ) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError> {
++    if event.kind == "error" || (event.kind.is_empty() && event.error.is_some()) {
++        let response_error =
++            response_error_from_stream_fields(event.error, event.code, event.message)
++                .map(api_error_from_response_error)
++                .unwrap_or_else(|| ApiError::Stream("error event received".into()));
++        return Err(ResponsesEventError::Api(response_error));
++    }
++
+     match event.kind.as_str() {
+         "response.output_item.done" => {
+             if let Some(item_val) = event.item {
+@@ -385,33 +396,11 @@ pub fn process_responses_event(
+         }
+         "response.failed" => {
+             if let Some(resp_val) = event.response {
+-                let mut response_error = ApiError::Stream("response.failed event received".into());
+-                if let Some(error) = resp_val.get("error")
+-                    && let Ok(error) = serde_json::from_value::<Error>(error.clone())
+-                {
+-                    if is_context_window_error(&error) {
+-                        response_error = ApiError::ContextWindowExceeded;
+-                    } else if is_quota_exceeded_error(&error) {
+-                        response_error = ApiError::QuotaExceeded;
+-                    } else if is_usage_not_included(&error) {
+-                        response_error = ApiError::UsageNotIncluded;
+-                    } else if is_cyber_policy_error(&error) {
+-                        let message = cyber_policy_message(error.message);
+-                        response_error = ApiError::CyberPolicy { message };
+-                    } else if matches!(error.code.as_deref(), Some("invalid_prompt" | "bio_policy"))
+-                    {
+-                        let message = error
+-                            .message
+-                            .unwrap_or_else(|| "Invalid request.".to_string());
+-                        response_error = ApiError::InvalidRequest { message };
+-                    } else if is_server_overloaded_error(&error) {
+-                        response_error = ApiError::ServerOverloaded;
+-                    } else {
+-                        let delay = try_parse_retry_after(&error);
+-                        let message = error.message.unwrap_or_default();
+-                        response_error = ApiError::Retryable { message, delay };
+-                    }
+-                }
++                let response_error = resp_val
++                    .get("error")
++                    .and_then(|error| serde_json::from_value::<Error>(error.clone()).ok())
++                    .map(api_error_from_response_error)
++                    .unwrap_or_else(|| ApiError::Stream("response.failed event received".into()));
+                 return Err(ResponsesEventError::Api(response_error));
+             }
+ 
+@@ -621,6 +610,79 @@ fn try_parse_retry_after(err: &Error) -> Option<Duration> {
+     None
+ }
+ 
++fn api_error_from_response_error(error: Error) -> ApiError {
++    if is_context_window_error(&error) {
++        ApiError::ContextWindowExceeded
++    } else if is_quota_exceeded_error(&error) {
++        ApiError::QuotaExceeded
++    } else if is_usage_not_included(&error) {
++        ApiError::UsageNotIncluded
++    } else if is_cyber_policy_error(&error) {
++        let message = cyber_policy_message(error.message);
++        ApiError::CyberPolicy { message }
++    } else if matches!(error.code.as_deref(), Some("invalid_prompt" | "bio_policy")) {
++        let message = error
++            .message
++            .unwrap_or_else(|| "Invalid request.".to_string());
++        ApiError::InvalidRequest { message }
++    } else if is_server_overloaded_error(&error) {
++        ApiError::ServerOverloaded
++    } else {
++        let delay = try_parse_retry_after(&error);
++        let message = error.message.unwrap_or_default();
++        ApiError::Retryable { message, delay }
++    }
++}
++
++fn response_error_from_stream_fields(
++    error: Option<Value>,
++    code: Option<String>,
++    message: Option<String>,
++) -> Option<Error> {
++    if let Some(error) = error
++        && let Some(parsed) = parse_stream_error_value(error)
++    {
++        return Some(parsed);
++    }
++
++    if let Some(message) = message.as_deref()
++        && let Some(parsed) = parse_embedded_stream_error(message)
++    {
++        return Some(parsed);
++    }
++
++    if code.is_some() || message.is_some() {
++        Some(Error {
++            r#type: None,
++            code,
++            message,
++            plan_type: None,
++            resets_at: None,
++        })
++    } else {
++        None
++    }
++}
++
++fn parse_stream_error_value(error: Value) -> Option<Error> {
++    let embedded = error
++        .as_str()
++        .or_else(|| error.get("message").and_then(Value::as_str));
++    if let Some(embedded) = embedded
++        && let Some(parsed) = parse_embedded_stream_error(embedded)
++    {
++        return Some(parsed);
++    }
++
++    serde_json::from_value::<Error>(error).ok()
++}
++
++fn parse_embedded_stream_error(message: &str) -> Option<Error> {
++    let payload = serde_json::from_str::<Value>(message).ok()?;
++    let error = payload.get("error").cloned().unwrap_or(payload);
++    serde_json::from_value::<Error>(error).ok()
++}
++
+ fn is_context_window_error(error: &Error) -> bool {
+     error.code.as_deref() == Some("context_length_exceeded")
+ }
+@@ -1051,6 +1113,36 @@ mod tests {
+         }
+     }
+ 
++    #[tokio::test]
++    async fn cyber_policy_error_event_is_fatal_for_proxy_shapes() {
++        let streams = [
++            format!(
++                "event: error\ndata: {}\n\n",
++                r#"{"type":"error","code":"cyber_policy","message":"This request was flagged for cyber policy.","sequence_number":0}"#
++            ),
++            format!(
++                "event: error\ndata: {}\n\n",
++                r#"{"type":"error","error":{"type":"invalid_request","code":"cyber_policy","message":"This request was flagged for cyber policy."},"sequence_number":0}"#
++            ),
++            format!(
++                "data: {}\n\n",
++                r#"{"error":{"code":400,"message":"{\"error\":{\"type\":\"invalid_request\",\"code\":\"cyber_policy\",\"message\":\"This request was flagged for cyber policy.\",\"param\":null}}","type":"upstream_error"}}"#
++            ),
++        ];
++
++        for sse in streams {
++            let events = collect_events(&[sse.as_bytes()]).await;
++
++            assert_eq!(events.len(), 1);
++            match &events[0] {
++                Err(ApiError::CyberPolicy { message }) => {
++                    assert_eq!(message, "This request was flagged for cyber policy.");
++                }
++                other => panic!("unexpected event: {other:?}"),
++            }
++        }
++    }
++
+     #[tokio::test]
+     async fn cyber_policy_error_uses_fallback_for_empty_message() {
+         let raw_error = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_fatal_cyber","object":"response","created_at":1759771626,"status":"failed","background":false,"error":{"code":"cyber_policy","message":"   "},"incomplete_details":null}}"#;
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index bafb368..996b99a 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -300,6 +300,9 @@ pub(crate) async fn run_turn(
+                     needs_follow_up: model_needs_follow_up,
+                     last_agent_message: sampling_request_last_agent_message,
+                 } = sampling_request_output;
++                if let Some(message) = sampling_request_last_agent_message {
++                    last_agent_message = Some(message);
++                }
+                 can_drain_pending_input = true;
+                 let (has_pending_input, token_status, estimated_token_count) = async {
+                     let has_pending_input =
+@@ -370,7 +373,6 @@ pub(crate) async fn run_turn(
+                 }
+ 
+                 if !needs_follow_up {
+-                    last_agent_message = sampling_request_last_agent_message;
+                     let stop_outcome = run_turn_stop_hooks(
+                         &sess,
+                         &turn_context,
+diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
+index c6d9d29..eaa2fd3 100644
+--- a/codex-rs/core/src/tasks/mod.rs
++++ b/codex-rs/core/src/tasks/mod.rs
+@@ -565,7 +565,8 @@ impl Session {
+         turn_context: Arc<TurnContext>,
+         task_result: SessionTaskResult,
+     ) {
+-        let (last_agent_message, abort_reason) = match task_result {
++        let completed_without_agent_message = matches!(&task_result, Ok(None));
++        let (last_agent_message, mut abort_reason) = match task_result {
+             Ok(last_agent_message) => (last_agent_message, None),
+             Err(CodexErr::TurnAborted) => (None, Some(TurnAbortReason::Interrupted)),
+             Err(err) => {
+@@ -577,15 +578,16 @@ impl Session {
+             .turn_metadata_state
+             .cancel_git_enrichment_task();
+ 
+-        let turn_state = {
++        let task_kind_and_turn_state = {
+             let mut active = self.active_turn.lock().await;
+             active.as_mut().and_then(|active_turn| {
+                 let task = active_turn.task.take()?;
++                let task_kind = task.kind;
+                 task.handle.detach();
+-                Some(Arc::clone(&active_turn.turn_state))
++                Some((task_kind, Arc::clone(&active_turn.turn_state)))
+             })
+         };
+-        let Some(turn_state) = turn_state else {
++        let Some((task_kind, turn_state)) = task_kind_and_turn_state else {
+             return;
+         };
+         let pending_input = self
+@@ -600,6 +602,21 @@ impl Session {
+                 ts.token_usage_at_turn_start.clone(),
+             )
+         };
++        let time_to_first_token_ms = turn_context
++            .turn_timing_state
++            .time_to_first_token_ms()
++            .await;
++        if task_kind == TaskKind::Regular
++            && completed_without_agent_message
++            && time_to_first_token_ms.is_some()
++        {
++            warn!(
++                turn_id = %turn_context.sub_id,
++                turn_tool_calls,
++                "regular task completed without a final agent message after producing model output; treating the turn as interrupted"
++            );
++            abort_reason = Some(TurnAbortReason::Interrupted);
++        }
+         if !pending_input.is_empty() {
+             for pending_input_item in pending_input {
+                 let hook_outcome =
+@@ -760,10 +777,6 @@ impl Session {
+                 duration_ms,
+             })
+         } else {
+-            let time_to_first_token_ms = turn_context
+-                .turn_timing_state
+-                .time_to_first_token_ms()
+-                .await;
+             self.emit_turn_stop_lifecycle(turn_context.extension_data.as_ref())
+                 .await;
+             EventMsg::TurnComplete(TurnCompleteEvent {
+diff --git a/codex-rs/core/tests/suite/mod.rs b/codex-rs/core/tests/suite/mod.rs
+index f1fae54..1b1e34a 100644
+--- a/codex-rs/core/tests/suite/mod.rs
++++ b/codex-rs/core/tests/suite/mod.rs
+@@ -128,6 +128,7 @@ mod tool_harness;
+ mod tool_parallelism;
+ mod tools;
+ mod truncation;
++mod turn_completion;
+ mod turn_state;
+ mod unified_exec;
+ mod unified_exec_process_events;
+diff --git a/codex-rs/core/tests/suite/turn_completion.rs b/codex-rs/core/tests/suite/turn_completion.rs
+new file mode 100644
+index 0000000..351f8c7
+--- /dev/null
++++ b/codex-rs/core/tests/suite/turn_completion.rs
+@@ -0,0 +1,254 @@
++use anyhow::Result;
++use codex_protocol::protocol::CodexErrorInfo;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::Op;
++use codex_protocol::protocol::TurnAbortReason;
++use codex_protocol::user_input::UserInput;
++use core_test_support::responses::ev_assistant_message;
++use core_test_support::responses::ev_completed;
++use core_test_support::responses::ev_function_call;
++use core_test_support::responses::ev_message_item_added;
++use core_test_support::responses::ev_output_text_delta;
++use core_test_support::responses::ev_reasoning_item;
++use core_test_support::responses::ev_response_created;
++use core_test_support::responses::mount_sse_sequence;
++use core_test_support::responses::sse;
++use core_test_support::responses::start_mock_server;
++use core_test_support::test_codex::test_codex;
++use core_test_support::wait_for_event_match;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn turn_complete_preserves_agent_message_across_tool_follow_up() -> Result<()> {
++    let server = start_mock_server().await;
++    let tool_args = json!({
++        "command": "echo tool-result",
++        "timeout_ms": 1_000,
++    });
++    let responses = mount_sse_sequence(
++        &server,
++        vec![
++            sse(vec![
++                ev_response_created("resp-1"),
++                ev_assistant_message("msg-1", "intermediate answer"),
++                ev_function_call(
++                    "call-1",
++                    "shell_command",
++                    &serde_json::to_string(&tool_args)?,
++                ),
++                ev_completed("resp-1"),
++            ]),
++            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
++        ],
++    )
++    .await;
++    let test = test_codex().build_with_auto_env(&server).await?;
++
++    test.codex
++        .submit(Op::UserInput {
++            items: vec![UserInput::Text {
++                text: "run the tool".to_string(),
++                text_elements: Vec::new(),
++            }],
++            final_output_json_schema: None,
++            responsesapi_client_metadata: None,
++            additional_context: Default::default(),
++            thread_settings: Default::default(),
++        })
++        .await?;
++
++    let completed = wait_for_event_match(&test.codex, |event| match event {
++        EventMsg::TurnComplete(completed) => Some(completed.clone()),
++        _ => None,
++    })
++    .await;
++    assert_eq!(
++        completed.last_agent_message.as_deref(),
++        Some("intermediate answer")
++    );
++    assert_eq!(responses.requests().len(), 2);
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn tool_follow_up_without_any_agent_message_is_aborted_as_interrupted() -> Result<()> {
++    let server = start_mock_server().await;
++    let tool_args = json!({
++        "command": "echo tool-result",
++        "timeout_ms": 1_000,
++    });
++    let responses = mount_sse_sequence(
++        &server,
++        vec![
++            sse(vec![
++                ev_response_created("resp-1"),
++                ev_function_call(
++                    "call-1",
++                    "shell_command",
++                    &serde_json::to_string(&tool_args)?,
++                ),
++                ev_completed("resp-1"),
++            ]),
++            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
++        ],
++    )
++    .await;
++    let test = test_codex().build_with_auto_env(&server).await?;
++
++    test.codex
++        .submit(Op::UserInput {
++            items: vec![UserInput::Text {
++                text: "run the tool".to_string(),
++                text_elements: Vec::new(),
++            }],
++            final_output_json_schema: None,
++            responsesapi_client_metadata: None,
++            additional_context: Default::default(),
++            thread_settings: Default::default(),
++        })
++        .await?;
++
++    let aborted = wait_for_event_match(&test.codex, |event| match event {
++        EventMsg::TurnAborted(aborted) => Some(aborted.clone()),
++        _ => None,
++    })
++    .await;
++    assert_eq!(aborted.reason, TurnAbortReason::Interrupted);
++    assert_eq!(responses.requests().len(), 2);
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn reasoning_without_any_agent_message_is_aborted_as_interrupted() -> Result<()> {
++    let server = start_mock_server().await;
++    let response = mount_sse_sequence(
++        &server,
++        vec![sse(vec![
++            ev_response_created("resp-1"),
++            ev_reasoning_item("reasoning-1", &["working"], &[]),
++            ev_completed("resp-1"),
++        ])],
++    )
++    .await;
++    let test = test_codex().build_with_auto_env(&server).await?;
++
++    test.codex
++        .submit(Op::UserInput {
++            items: vec![UserInput::Text {
++                text: "reason without a final answer".to_string(),
++                text_elements: Vec::new(),
++            }],
++            final_output_json_schema: None,
++            responsesapi_client_metadata: None,
++            additional_context: Default::default(),
++            thread_settings: Default::default(),
++        })
++        .await?;
++
++    let aborted = wait_for_event_match(&test.codex, |event| match event {
++        EventMsg::TurnAborted(aborted) => Some(aborted.clone()),
++        _ => None,
++    })
++    .await;
++    assert_eq!(aborted.reason, TurnAbortReason::Interrupted);
++    assert_eq!(response.requests().len(), 1);
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn partial_agent_message_followed_by_proxy_cyber_policy_error_is_aborted() -> Result<()> {
++    let server = start_mock_server().await;
++    let upstream_error = json!({
++        "error": {
++            "type": "invalid_request",
++            "code": "cyber_policy",
++            "message": "synthetic cyber policy error",
++            "param": null
++        }
++    })
++    .to_string();
++    let proxy_error = json!({
++        "error": {
++            "code": 400,
++            "message": upstream_error,
++            "type": "upstream_error"
++        }
++    });
++    let stream = format!(
++        "{}data: {proxy_error}\n\n",
++        sse(vec![
++            ev_response_created("resp-1"),
++            ev_message_item_added("msg-1", ""),
++            ev_output_text_delta("partial answer"),
++        ])
++    );
++    let response = mount_sse_sequence(&server, vec![stream]).await;
++    let test = test_codex().build_with_auto_env(&server).await?;
++
++    test.codex
++        .submit(Op::UserInput {
++            items: vec![UserInput::Text {
++                text: "start an answer".to_string(),
++                text_elements: Vec::new(),
++            }],
++            final_output_json_schema: None,
++            responsesapi_client_metadata: None,
++            additional_context: Default::default(),
++            thread_settings: Default::default(),
++        })
++        .await?;
++
++    let error = wait_for_event_match(&test.codex, |event| match event {
++        EventMsg::Error(error) => Some(error.clone()),
++        _ => None,
++    })
++    .await;
++    assert_eq!(error.message, "synthetic cyber policy error");
++    assert_eq!(error.codex_error_info, Some(CodexErrorInfo::CyberPolicy));
++
++    let aborted = wait_for_event_match(&test.codex, |event| match event {
++        EventMsg::TurnAborted(aborted) => Some(aborted.clone()),
++        _ => None,
++    })
++    .await;
++    assert_eq!(aborted.reason, TurnAbortReason::Interrupted);
++    assert_eq!(response.requests().len(), 1);
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn empty_completion_without_model_output_remains_complete() -> Result<()> {
++    let server = start_mock_server().await;
++    let response = mount_sse_sequence(
++        &server,
++        vec![sse(vec![
++            ev_response_created("resp-1"),
++            ev_completed("resp-1"),
++        ])],
++    )
++    .await;
++    let test = test_codex().build_with_auto_env(&server).await?;
++
++    test.codex
++        .submit(Op::UserInput {
++            items: vec![UserInput::Text {
++                text: "finish without a message".to_string(),
++                text_elements: Vec::new(),
++            }],
++            final_output_json_schema: None,
++            responsesapi_client_metadata: None,
++            additional_context: Default::default(),
++            thread_settings: Default::default(),
++        })
++        .await?;
++
++    let completed = wait_for_event_match(&test.codex, |event| match event {
++        EventMsg::TurnComplete(completed) => Some(completed.clone()),
++        _ => None,
++    })
++    .await;
++    assert_eq!(completed.last_agent_message, None);
++    assert_eq!(response.requests().len(), 1);
++    Ok(())
++}

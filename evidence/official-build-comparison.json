@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "platform": "Windows x64 Microsoft Store/MSIX",
+  "builds": [
+    {
+      "packageVersion": "26.707.6957.0",
+      "inspectionState": "registered reproduction base",
+      "appAsarBytes": 199361686,
+      "appAsarSha256": "A728370E715DFA2E8AAA01D1E67C4C27087608CD8FA527D1B3D46CED78A3A8EB"
+    },
+    {
+      "packageVersion": "26.707.8479.0",
+      "inspectionState": "locally staged official update",
+      "appAsarBytes": 199363505,
+      "appAsarSha256": "8DDC04D44985CA64D59097A76E5871C1010EEB94D7305FD61C5B3F111D452DFF"
+    }
+  ],
+  "identicalRelevantAssets": [
+    {
+      "path": "webview/assets/app-main-CnX2qEsn.js",
+      "bytes": 862724,
+      "sha256": "2B30220B986AF70B4D24386A54FF4CCB6D21162615FC4723B5CFDF4FDB68BC49"
+    },
+    {
+      "path": "webview/assets/browser-sidebar-manager-BKDVnejf.js",
+      "bytes": 52476,
+      "sha256": "F284A94D9ECEDA6A49E00EA9C0F2F81C3CD7044E45E5154C9D49FB02BB9201CF"
+    }
+  ],
+  "semanticInspection": {
+    "agentOriginOnlyHandoffBranchesInBothMainBundles": 2,
+    "boundedRegistrationRecoveryPresent": false,
+    "allOriginHandoffPreservationPresent": false
+  },
+  "notes": [
+    "The main bundle filename/hash differs, but the inspected legacy handoff branches remain in both packages.",
+    "The comparison establishes that the described lifecycle repair is absent; it does not attribute every IAB crash to one cause."
+  ]
+}
